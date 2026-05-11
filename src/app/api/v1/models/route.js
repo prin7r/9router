@@ -222,13 +222,14 @@ export async function buildModelsList(kindFilter) {
     for (const [providerId, conn] of activeConnectionByProvider.entries()) {
       if (!providerMatchesKinds(providerId, kindFilter)) continue;
 
-      const staticAlias = PROVIDER_ID_TO_ALIAS[providerId] || providerId;
+      const configuredAlias = PROVIDER_ID_TO_ALIAS[providerId] || providerId;
+      const providerModelKey = PROVIDER_MODELS[providerId] ? providerId : configuredAlias;
       const outputAlias = (
         conn?.providerSpecificData?.prefix
+        || providerModelKey
         || getProviderAlias(providerId)
-        || staticAlias
       ).trim();
-      const providerModels = PROVIDER_MODELS[staticAlias] || [];
+      const providerModels = PROVIDER_MODELS[providerModelKey] || [];
       const enabledModels = conn?.providerSpecificData?.enabledModels;
       const hasExplicitEnabledModels =
         Array.isArray(enabledModels) && enabledModels.length > 0;
@@ -259,11 +260,14 @@ export async function buildModelsList(kindFilter) {
           if (modelId.startsWith(`${outputAlias}/`)) {
             return modelId.slice(outputAlias.length + 1);
           }
-          if (modelId.startsWith(`${staticAlias}/`)) {
-            return modelId.slice(staticAlias.length + 1);
+          if (modelId.startsWith(`${providerModelKey}/`)) {
+            return modelId.slice(providerModelKey.length + 1);
           }
           if (modelId.startsWith(`${providerId}/`)) {
             return modelId.slice(providerId.length + 1);
+          }
+          if (modelId.startsWith(`${configuredAlias}/`)) {
+            return modelId.slice(configuredAlias.length + 1);
           }
           return modelId;
         })
@@ -273,7 +277,7 @@ export async function buildModelsList(kindFilter) {
         .filter((m) => {
           if (!m?.id || (m.type && m.type !== "llm")) return false;
           const alias = m.providerAlias;
-          return alias === staticAlias || alias === outputAlias || alias === providerId;
+          return alias === providerModelKey || alias === configuredAlias || alias === outputAlias || alias === providerId;
         })
         .map((m) => String(m.id).trim())
         .filter((modelId) => modelId !== "");
@@ -283,7 +287,8 @@ export async function buildModelsList(kindFilter) {
           if (typeof fullModel !== "string" || !fullModel.includes("/")) return false;
           return (
             fullModel.startsWith(`${outputAlias}/`) ||
-            fullModel.startsWith(`${staticAlias}/`) ||
+            fullModel.startsWith(`${providerModelKey}/`) ||
+            fullModel.startsWith(`${configuredAlias}/`) ||
             fullModel.startsWith(`${providerId}/`)
           );
         })
@@ -291,11 +296,14 @@ export async function buildModelsList(kindFilter) {
           if (fullModel.startsWith(`${outputAlias}/`)) {
             return fullModel.slice(outputAlias.length + 1);
           }
-          if (fullModel.startsWith(`${staticAlias}/`)) {
-            return fullModel.slice(staticAlias.length + 1);
+          if (fullModel.startsWith(`${providerModelKey}/`)) {
+            return fullModel.slice(providerModelKey.length + 1);
           }
           if (fullModel.startsWith(`${providerId}/`)) {
             return fullModel.slice(providerId.length + 1);
+          }
+          if (fullModel.startsWith(`${configuredAlias}/`)) {
+            return fullModel.slice(configuredAlias.length + 1);
           }
           return fullModel;
         })
@@ -307,7 +315,7 @@ export async function buildModelsList(kindFilter) {
         // Resolve kind: prefer static metadata, otherwise infer from ID heuristics
         const kind = staticModelKindById.get(modelId) || inferKindFromUnknownModelId(modelId);
         if (!kindFilter.includes(kind)) continue;
-        if (isDisabled(outputAlias, modelId) || isDisabled(staticAlias, modelId)) continue;
+        if (isDisabled(outputAlias, modelId) || isDisabled(providerModelKey, modelId) || isDisabled(configuredAlias, modelId)) continue;
 
         models.push({
           id: `${outputAlias}/${modelId}`,
@@ -330,7 +338,7 @@ export async function buildModelsList(kindFilter) {
         }
       }
       for (const subId of subConfigModels) {
-        if (isDisabled(outputAlias, subId) || isDisabled(staticAlias, subId)) continue;
+        if (isDisabled(outputAlias, subId) || isDisabled(providerModelKey, subId) || isDisabled(configuredAlias, subId)) continue;
         models.push({
           id: `${outputAlias}/${subId}`,
           object: "model",
