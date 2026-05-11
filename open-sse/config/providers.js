@@ -223,7 +223,7 @@ export const PROVIDERS = {
     format: "openai",
     headers: {}
   },
-  opencode: {
+  "opencode-local": {
     baseUrl: "http://localhost:4096/v1/chat/completions",
     format: "openai",
     headers: {}
