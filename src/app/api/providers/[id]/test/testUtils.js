@@ -482,6 +482,52 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         const res = await fetchWithConnectionProxy("https://api.deepseek.com/models", { headers: { Authorization: `Bearer ${connection.apiKey}` } }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
       }
+      case "opencode-go": {
+        const res = await fetchWithConnectionProxy("https://opencode.ai/zen/go/v1/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${connection.apiKey}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "kimi-k2.6", max_tokens: 1, messages: [{ role: "user", content: "test" }] }),
+        }, effectiveProxy);
+        const valid = res.status !== 401 && res.status !== 403;
+        return { valid, error: valid ? null : "Invalid API key" };
+      }
+      case "commandcode": {
+        const res = await fetchWithConnectionProxy("https://api.commandcode.ai/alpha/generate", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${connection.apiKey}`,
+            "content-type": "application/json",
+            "x-command-code-version": "0.25.7",
+            "x-cli-environment": "cli",
+          },
+          body: JSON.stringify({
+            threadId: crypto.randomUUID(),
+            memory: "",
+            config: {
+              workingDir: process.cwd(),
+              date: new Date().toISOString().slice(0, 10),
+              environment: process.platform,
+              structure: [],
+              isGitRepo: false,
+              currentBranch: "",
+              mainBranch: "",
+              gitStatus: "",
+              recentCommits: [],
+            },
+            params: {
+              model: "deepseek/deepseek-v4-pro",
+              messages: [{ role: "user", content: [{ type: "text", text: "test" }] }],
+              stream: false,
+              max_tokens: 1,
+              temperature: 0.3,
+            },
+          }),
+        }, effectiveProxy);
+        if (res.status === 401 || res.status === 403) return { valid: false, error: "Invalid API key" };
+        const text = await res.text().catch(() => "");
+        if (/insufficient credits/i.test(text)) return { valid: false, error: "Insufficient credits" };
+        return { valid: res.ok, error: res.ok ? null : `API returned ${res.status}` };
+      }
       case "groq": {
         const res = await fetchWithConnectionProxy("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${connection.apiKey}` } }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };

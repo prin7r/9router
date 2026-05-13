@@ -52,6 +52,27 @@ const CLAUDE_CONFIG = {
   apiVersion: "2023-06-01",
 };
 
+const COMMAND_CODE_CONFIG = {
+  apiBaseUrl: "https://api.commandcode.ai",
+  cliVersion: "0.25.12",
+};
+
+const COMMAND_CODE_MONTHLY_CREDITS = {
+  "individual-go": 10,
+  "individual-pro": 30,
+  "individual-max": 150,
+  "individual-ultra": 300,
+  "teams-pro": 40,
+};
+
+const COMMAND_CODE_PLAN_LABELS = {
+  "individual-go": "Command Code Go",
+  "individual-pro": "Command Code Pro",
+  "individual-max": "Command Code Max",
+  "individual-ultra": "Command Code Ultra",
+  "teams-pro": "Command Code Teams Pro",
+};
+
 /**
  * Get usage data for a provider connection
  * @param {Object} connection - Provider connection with accessToken
@@ -79,6 +100,8 @@ export async function getUsageForProvider(connection, proxyOptions = null) {
       return await getIflowUsage(accessToken);
     case "ollama":
       return await getOllamaUsage(accessToken);
+    case "commandcode":
+      return await getCommandCodeUsage(apiKey || accessToken, proxyOptions);
     case "glm":
     case "glm-cn":
       return await getGlmUsage(apiKey, provider, proxyOptions);
@@ -591,6 +614,156 @@ async function getClaudeUsageLegacy(accessToken, proxyOptions = null) {
   } catch (error) {
     return { message: `Claude connected. Unable to fetch usage: ${error.message}` };
   }
+}
+
+async function getCommandCodeUsage(apiKey, proxyOptions = null) {
+  if (!apiKey) {
+    return { message: "Command Code API key not available.", quotas: {} };
+  }
+
+  try {
+    const who = await fetchCommandCodeJson(apiKey, "/alpha/whoami", null, proxyOptions);
+    if (!who.ok) {
+      return { source: "provider-api", message: `Command Code whoami API error (${who.status}).`, quotas: {} };
+    }
+
+    const orgId = commandCodeOrgId(who.data);
+    const params = orgId ? { orgId } : null;
+    const subscriptionResponse = await fetchCommandCodeJson(apiKey, "/alpha/billing/subscriptions", params, proxyOptions);
+    const creditsResponse = await fetchCommandCodeJson(apiKey, "/alpha/billing/credits", params, proxyOptions);
+    const usageResponse = await fetchCommandCodeJson(apiKey, "/alpha/usage/summary", params, proxyOptions);
+
+    if (!subscriptionResponse.ok && !creditsResponse.ok && !usageResponse.ok) {
+      return {
+        source: "provider-api",
+        message: `Command Code billing APIs unavailable (${subscriptionResponse.status}/${creditsResponse.status}/${usageResponse.status}).`,
+        quotas: {},
+      };
+    }
+
+    const subscription = commandCodeSubscription(subscriptionResponse.data);
+    const credits = commandCodeCredits(creditsResponse.data);
+    const usage = commandCodeUsageSummary(usageResponse.data);
+    const planId = subscription?.planId || usage?.planId || "";
+    const planTotal = COMMAND_CODE_MONTHLY_CREDITS[planId];
+    const used = toFiniteNumber(usage?.totalMonthlyCredits ?? usage?.totalCredits ?? usage?.totalCost, 0);
+    const monthlyRemaining = toFiniteNumber(credits?.monthlyCredits, NaN);
+    const inferredTotal = Number.isFinite(monthlyRemaining) ? used + monthlyRemaining : used;
+    const total = Number.isFinite(planTotal) ? planTotal : inferredTotal;
+    const remaining = Number.isFinite(monthlyRemaining) ? monthlyRemaining : Math.max(0, total - used);
+    const purchasedCredits = toFiniteNumber(credits?.purchasedCredits, 0);
+    const freeCredits = toFiniteNumber(credits?.freeCredits, 0);
+    const balanceCredits = purchasedCredits + freeCredits;
+    const resetAt = parseResetTime(subscription?.currentPeriodEnd || subscription?.current_period_end);
+    const quotas = {
+      monthly_credits: {
+        used,
+        total,
+        remaining,
+        remainingPercentage: total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : 0,
+        resetAt,
+        unlimited: false,
+        status: subscription?.status || "",
+      },
+    };
+
+    if (balanceCredits > 0) {
+      quotas.credit_balance = {
+        used: 0,
+        total: balanceCredits,
+        remaining: balanceCredits,
+        remainingPercentage: 100,
+        resetAt: null,
+        unlimited: false,
+      };
+    }
+
+    return {
+      plan: COMMAND_CODE_PLAN_LABELS[planId] || planId || "Command Code",
+      source: "provider-api",
+      account: commandCodeUser(who.data),
+      billingPeriodStart: parseResetTime(subscription?.currentPeriodStart || subscription?.current_period_start),
+      billingPeriodEnd: resetAt,
+      totalTokens: toFiniteNumber(usage?.totalTokens, 0),
+      quotas,
+    };
+  } catch (error) {
+    return { source: "provider-api", message: `Command Code usage API error: ${error.message}`, quotas: {} };
+  }
+}
+
+async function fetchCommandCodeJson(apiKey, pathname, params = null, proxyOptions = null, attempt = 0) {
+  const url = new URL(pathname, COMMAND_CODE_CONFIG.apiBaseUrl);
+  if (params && typeof params === "object") {
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+    }
+  }
+
+  let response;
+  try {
+    response = await proxyAwareFetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Accept": "application/json",
+        "x-command-code-version": COMMAND_CODE_CONFIG.cliVersion,
+        "x-cli-environment": "cli",
+      },
+    }, proxyOptions);
+  } catch (error) {
+    if (attempt < 2) {
+      await delay(250 * (attempt + 1));
+      return fetchCommandCodeJson(apiKey, pathname, params, proxyOptions, attempt + 1);
+    }
+    throw error;
+  }
+  const text = await response.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+  }
+  return { ok: response.ok, status: response.status, data };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function commandCodeUser(payload) {
+  const user = payload?.user && typeof payload.user === "object" ? payload.user : {};
+  return {
+    id: user.id || "",
+    name: user.name || user.userName || "",
+    email: user.email || "",
+  };
+}
+
+function commandCodeOrgId(payload) {
+  return payload?.org?.id || payload?.organization?.id || payload?.organizations?.[0]?.id || null;
+}
+
+function commandCodeSubscription(payload) {
+  if (payload?.data && typeof payload.data === "object" && !Array.isArray(payload.data)) return payload.data;
+  if (Array.isArray(payload?.data)) return payload.data[0] || null;
+  if (Array.isArray(payload?.subscriptions)) return payload.subscriptions[0] || null;
+  if (payload?.subscription && typeof payload.subscription === "object") return payload.subscription;
+  return payload && typeof payload === "object" ? payload : null;
+}
+
+function commandCodeCredits(payload) {
+  if (payload?.credits && typeof payload.credits === "object") return payload.credits;
+  if (payload?.data?.credits && typeof payload.data.credits === "object") return payload.data.credits;
+  return payload && typeof payload === "object" ? payload : {};
+}
+
+function commandCodeUsageSummary(payload) {
+  if (payload?.data && typeof payload.data === "object" && !Array.isArray(payload.data)) return payload.data;
+  return payload && typeof payload === "object" ? payload : {};
 }
 
 /**

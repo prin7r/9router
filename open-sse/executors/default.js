@@ -12,7 +12,15 @@ export class DefaultExecutor extends BaseExecutor {
   }
 
   transformRequest(model, body) {
-    return injectReasoningContent({ provider: this.provider, model, body });
+    const next = injectReasoningContent({ provider: this.provider, model, body });
+    if ((this.provider === "claude" || this.provider === "anthropic" || this.config?.format === "claude") && next && typeof next === "object") {
+      // Claude Code 2.1 can send context_management in its native payload, but
+      // the current Anthropic Messages API rejects that field for some routed
+      // Claude subscription models. Strip it at the 9router boundary so Claude
+      // Code and Claude Agent SDK can keep using native streaming mode.
+      delete next.context_management;
+    }
+    return next;
   }
 
   buildUrl(model, stream, urlIndex = 0, credentials = null) {

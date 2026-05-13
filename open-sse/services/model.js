@@ -192,13 +192,13 @@ export async function getModelInfoCore(modelStr, aliasesOrGetter) {
  * Used as fallback when no provider prefix or alias is given
  */
 function inferProviderFromModelName(modelName) {
-  if (!modelName) return "openai";
+  if (!modelName) return "codex";
   const m = modelName.toLowerCase();
-  if (m.startsWith("claude-")) return "anthropic";
+  if (m.startsWith("claude-")) return "claude";
   if (m.startsWith("gemini-")) return "gemini";
-  if (m.startsWith("gpt-")) return "openai";
+  if (m.startsWith("gpt-")) return "codex";
   if (m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"))
-    return "openai";
+    return "codex";
   if (m.startsWith("deepseek-")) return "openrouter";
   // Default fallback
   return "openai";
