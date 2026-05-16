@@ -52,6 +52,11 @@ const CLAUDE_CONFIG = {
   apiVersion: "2023-06-01",
 };
 
+const OPENROUTER_CONFIG = {
+  keyUrl: "https://openrouter.ai/api/v1/key",
+  creditsUrl: "https://openrouter.ai/api/v1/credits",
+};
+
 const COMMAND_CODE_CONFIG = {
   apiBaseUrl: "https://api.commandcode.ai",
   cliVersion: "0.25.12",
@@ -100,6 +105,8 @@ export async function getUsageForProvider(connection, proxyOptions = null) {
       return await getIflowUsage(accessToken);
     case "ollama":
       return await getOllamaUsage(accessToken);
+    case "openrouter":
+      return await getOpenRouterUsage(apiKey || accessToken, proxyOptions);
     case "commandcode":
       return await getCommandCodeUsage(apiKey || accessToken, proxyOptions);
     case "glm":
@@ -557,11 +564,191 @@ async function getClaudeUsage(accessToken, proxyOptions = null) {
     }
 
     // Fallback: legacy settings + org usage endpoint
+    const headerUsage = await getClaudeRateLimitHeaderUsage(accessToken, proxyOptions);
+    if (headerUsage) return headerUsage;
     console.warn(`[Claude Usage] OAuth endpoint returned ${oauthResponse.status}, falling back to legacy`);
     return await getClaudeUsageLegacy(accessToken, proxyOptions);
   } catch (error) {
+    const headerUsage = await getClaudeRateLimitHeaderUsage(accessToken, proxyOptions);
+    if (headerUsage) return headerUsage;
     return { message: `Claude connected. Unable to fetch usage: ${error.message}` };
   }
+}
+
+async function getClaudeRateLimitHeaderUsage(accessToken, proxyOptions = null) {
+  try {
+    const headers = {
+      "anthropic-version": CLAUDE_CONFIG.apiVersion,
+      "content-type": "application/json",
+    };
+    if (isClaudeApiKey(accessToken)) {
+      headers["x-api-key"] = accessToken;
+    } else {
+      headers["Authorization"] = `Bearer ${accessToken}`;
+      headers["anthropic-beta"] = "oauth-2025-04-20";
+      headers["User-Agent"] = "claude-cli/2.1.92 (external, sdk-cli)";
+    }
+    const response = await proxyAwareFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1,
+        messages: [{ role: "user", content: "x" }],
+      }),
+    }, proxyOptions);
+    const quotas = {};
+    const fiveHour = claudeHeaderQuota(response.headers, "5h", "session (5h)");
+    const sevenDay = claudeHeaderQuota(response.headers, "7d", "weekly (7d)");
+    if (fiveHour) quotas["session (5h)"] = fiveHour;
+    if (sevenDay) quotas["weekly (7d)"] = sevenDay;
+    if (Object.keys(quotas).length === 0) return null;
+    return {
+      plan: "Claude Code",
+      source: "provider-api",
+      message: response.ok ? "" : `Claude headers available; probe HTTP ${response.status}.`,
+      quotas,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isClaudeApiKey(value) {
+  return typeof value === "string" && /^sk-ant-(api|admin)/i.test(value);
+}
+
+function claudeHeaderQuota(headers, windowId, name) {
+  const utilization = toFiniteNumber(headers.get(`anthropic-ratelimit-unified-${windowId}-utilization`), NaN);
+  const resetEpoch = toFiniteNumber(headers.get(`anthropic-ratelimit-unified-${windowId}-reset`), NaN);
+  const status = headers.get(`anthropic-ratelimit-unified-${windowId}-status`) || "";
+  if (!Number.isFinite(utilization) && !Number.isFinite(resetEpoch)) return null;
+  const used = Number.isFinite(utilization) ? Math.max(0, utilization * 100) : 0;
+  const remaining = Math.max(0, 100 - used);
+  return {
+    used,
+    total: 100,
+    remaining,
+    remainingPercentage: remaining,
+    resetAt: Number.isFinite(resetEpoch) ? new Date(resetEpoch * 1000).toISOString() : null,
+    unlimited: false,
+    status,
+    window: windowId === "5h" ? "5h" : "7d",
+    name,
+  };
+}
+
+async function getOpenRouterUsage(apiKey, proxyOptions = null) {
+  if (!apiKey) {
+    return { source: "provider-api", message: "OpenRouter API key not available.", quotas: {} };
+  }
+
+  try {
+    const [keyResponse, creditsResponse] = await Promise.all([
+      fetchOpenRouterJson(apiKey, OPENROUTER_CONFIG.keyUrl, proxyOptions),
+      fetchOpenRouterJson(apiKey, OPENROUTER_CONFIG.creditsUrl, proxyOptions),
+    ]);
+
+    if (!keyResponse.ok && !creditsResponse.ok) {
+      return {
+        source: "provider-api",
+        message: `OpenRouter key and credits APIs unavailable (${keyResponse.status}/${creditsResponse.status}).`,
+        quotas: {},
+      };
+    }
+
+    const keyData = unwrapOpenRouterPayload(keyResponse.data);
+    const creditsData = unwrapOpenRouterPayload(creditsResponse.data);
+    const quotas = {};
+
+    const usage = toFiniteNumber(keyData?.usage, NaN);
+    const limit = toFiniteNumber(keyData?.limit, NaN);
+    const limitRemaining = toFiniteNumber(keyData?.limit_remaining, NaN);
+    if (Number.isFinite(limit) || Number.isFinite(limitRemaining)) {
+      const total = Number.isFinite(limit) ? limit : Math.max(0, usage) + Math.max(0, limitRemaining);
+      const remaining = Number.isFinite(limitRemaining) ? limitRemaining : Math.max(0, total - Math.max(0, usage));
+      quotas.api_key_limit = {
+        used: Number.isFinite(usage) ? usage : Math.max(0, total - remaining),
+        total,
+        remaining,
+        remainingPercentage: total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : null,
+        resetAt: parseOpenRouterReset(keyData?.limit_reset),
+        unlimited: Boolean(keyData?.limit === null && keyData?.limit_remaining === null),
+        status: keyData?.disabled ? "disabled" : "",
+        window: "monthly",
+      };
+    }
+
+    const totalCredits = toFiniteNumber(creditsData?.total_credits, NaN);
+    const totalUsage = toFiniteNumber(creditsData?.total_usage, NaN);
+    if (Number.isFinite(totalCredits) || Number.isFinite(totalUsage)) {
+      const total = Number.isFinite(totalCredits) ? totalCredits : Math.max(0, totalUsage);
+      const used = Number.isFinite(totalUsage) ? totalUsage : 0;
+      const remaining = Math.max(0, total - used);
+      quotas.credit_balance = {
+        used,
+        total,
+        remaining,
+        remainingPercentage: total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : null,
+        resetAt: null,
+        unlimited: false,
+        status: "",
+        window: "balance",
+      };
+    }
+
+    return {
+      plan: keyData?.is_free_tier ? "OpenRouter free tier" : "OpenRouter",
+      source: "provider-api",
+      account: {
+        label: keyData?.label || "",
+        is_free_tier: keyData?.is_free_tier ?? null,
+        is_provisioning_key: keyData?.is_provisioning_key ?? null,
+        is_management_key: keyData?.is_management_key ?? null,
+      },
+      billingPeriodEnd: parseResetTime(keyData?.expires_at),
+      quotas,
+      message: keyResponse.ok || creditsResponse.ok ? "" : "OpenRouter connected. No quota payload returned.",
+    };
+  } catch (error) {
+    return { source: "provider-api", message: `OpenRouter usage API error: ${error.message}`, quotas: {} };
+  }
+}
+
+async function fetchOpenRouterJson(apiKey, url, proxyOptions = null) {
+  let response;
+  try {
+    response = await proxyAwareFetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+    }, proxyOptions);
+  } catch (error) {
+    throw error;
+  }
+  const text = await response.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+  }
+  return { ok: response.ok, status: response.status, data };
+}
+
+function unwrapOpenRouterPayload(payload) {
+  if (!payload || typeof payload !== "object") return {};
+  return payload.data && typeof payload.data === "object" ? payload.data : payload;
+}
+
+function parseOpenRouterReset(value) {
+  if (!value) return null;
+  if (typeof value === "string" && value.toLowerCase() === "monthly") return "monthly";
+  return parseResetTime(value);
 }
 
 /**
