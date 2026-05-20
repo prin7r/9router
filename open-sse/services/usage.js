@@ -57,6 +57,11 @@ const OPENROUTER_CONFIG = {
   creditsUrl: "https://openrouter.ai/api/v1/credits",
 };
 
+const FREEMODEL_CONFIG = {
+  apiBaseUrl: "https://api.freemodel.dev",
+  dashboardBaseUrl: "https://freemodel.dev",
+};
+
 const COMMAND_CODE_CONFIG = {
   apiBaseUrl: "https://api.commandcode.ai",
   cliVersion: "0.25.12",
@@ -76,6 +81,13 @@ const COMMAND_CODE_PLAN_LABELS = {
   "individual-max": "Command Code Max",
   "individual-ultra": "Command Code Ultra",
   "teams-pro": "Command Code Teams Pro",
+};
+
+const OPENCODE_GO_CONFIG = {
+  usageUrl: "https://opencode.ai/workspace/{workspaceId}/go",
+  rollingLimitUsd: 12,
+  weeklyLimitUsd: 30,
+  monthlyLimitUsd: 60,
 };
 
 /**
@@ -107,8 +119,12 @@ export async function getUsageForProvider(connection, proxyOptions = null) {
       return await getOllamaUsage(accessToken);
     case "openrouter":
       return await getOpenRouterUsage(apiKey || accessToken, proxyOptions);
+    case "freemodel":
+      return await getFreeModelUsage(apiKey || accessToken, providerSpecificData, proxyOptions);
     case "commandcode":
       return await getCommandCodeUsage(apiKey || accessToken, proxyOptions);
+    case "opencode-go":
+      return await getOpenCodeGoUsage(providerSpecificData, proxyOptions);
     case "glm":
     case "glm-cn":
       return await getGlmUsage(apiKey, provider, proxyOptions);
@@ -751,6 +767,232 @@ function parseOpenRouterReset(value) {
   return parseResetTime(value);
 }
 
+async function getFreeModelUsage(apiKey, providerSpecificData = {}, proxyOptions = null) {
+  const sessionCookie = normalizeFreeModelSessionCookie(providerSpecificData?.sessionCookie);
+  if (sessionCookie) {
+    const dashboardUsage = await getFreeModelDashboardUsage(sessionCookie, proxyOptions);
+    if (dashboardUsage.status === "ok" || !apiKey) return dashboardUsage;
+    const apiStatus = await getFreeModelApiKeyStatus(apiKey, proxyOptions);
+    return {
+      ...apiStatus,
+      message: [dashboardUsage.message, apiStatus.message].filter(Boolean).join(" "),
+    };
+  }
+
+  if (apiKey) return await getFreeModelApiKeyStatus(apiKey, proxyOptions);
+
+  return {
+    status: "missing-secret",
+    source: "dashboard-session",
+    plan: "FreeModel",
+    message: "FreeModel dashboard session and API key are not available.",
+    quotas: {},
+  };
+}
+
+async function getFreeModelDashboardUsage(sessionCookie, proxyOptions = null) {
+  try {
+    const [meResponse, usageResponse, billingResponse] = await Promise.all([
+      fetchFreeModelDashboardJson(sessionCookie, "/api/auth/me", proxyOptions),
+      fetchFreeModelDashboardJson(sessionCookie, "/api/usage", proxyOptions),
+      fetchFreeModelDashboardJson(sessionCookie, "/api/billing", proxyOptions),
+    ]);
+
+    if (usageResponse.status === 401 || usageResponse.status === 403) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "FreeModel",
+        message: "FreeModel dashboard session is expired or unauthorized.",
+        quotas: {},
+      };
+    }
+
+    if (!usageResponse.ok) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "FreeModel",
+        message: `FreeModel usage dashboard returned HTTP ${usageResponse.status}.`,
+        quotas: {},
+      };
+    }
+
+    const usage = usageResponse.data || {};
+    const billing = billingResponse.ok ? billingResponse.data || {} : {};
+    const user = meResponse.ok ? meResponse.data?.user || {} : {};
+    const quotas = {};
+    const window5h = formatFreeModelWindow(usage.window5h, "5h spend window", "5h");
+    const windowWeek = formatFreeModelWindow(usage.windowWeek, "weekly spend window", "7d");
+    if (window5h) quotas.window_5h = window5h;
+    if (windowWeek) quotas.window_week = windowWeek;
+
+    const creditCents = toFiniteNumber(billing.creditCents, NaN);
+    if (Number.isFinite(creditCents)) {
+      quotas.credit_balance = {
+        used: 0,
+        total: creditCents,
+        remaining: creditCents,
+        remainingPercentage: 100,
+        resetAt: null,
+        unlimited: false,
+        status: billing.billingEnabled === false ? "billing-disabled" : "",
+        window: "balance",
+        source: "dashboard-session",
+      };
+    }
+
+    return {
+      status: "ok",
+      source: "dashboard-session",
+      plan: freeModelPlanLabel(billing),
+      account: {
+        id: user.id != null ? String(user.id) : "",
+        email: user.email || "",
+        name: user.name || "",
+        billingEnabled: billing.billingEnabled ?? null,
+        requireVerification: billing.requireVerification ?? null,
+      },
+      totalTokens: toFiniteNumber(usage.totalTokens, 0),
+      quotas,
+      extraUsage: {
+        totalRequests: toFiniteNumber(usage.totalRequests, 0),
+        todayCacheReadTokens: toFiniteNumber(usage.todayCacheReadTokens, 0),
+        todayCacheWriteTokens: toFiniteNumber(usage.todayCacheWriteTokens, 0),
+        avgLatency: toFiniteNumber(usage.avgLatency, null),
+      },
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      source: "dashboard-session",
+      plan: "FreeModel",
+      message: `FreeModel dashboard usage fetch failed: ${error.message}`,
+      quotas: {},
+    };
+  }
+}
+
+async function getFreeModelApiKeyStatus(apiKey, proxyOptions = null) {
+  if (!apiKey) {
+    return {
+      status: "missing-secret",
+      source: "provider-api",
+      plan: "FreeModel API",
+      message: "FreeModel API key not available.",
+      quotas: {},
+    };
+  }
+
+  try {
+    const response = await proxyAwareFetch(`${FREEMODEL_CONFIG.apiBaseUrl}/v1/models`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+    }, proxyOptions);
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+    }
+
+    if (!response.ok) {
+      return {
+        status: "unavailable",
+        source: "provider-api",
+        plan: "FreeModel API",
+        message: `FreeModel models API returned HTTP ${response.status}.`,
+        quotas: {},
+      };
+    }
+
+    const models = Array.isArray(data?.data) ? data.data : [];
+    const modelIds = models.map((model) => model?.id).filter(Boolean);
+    const preferredModels = modelIds.filter((id) => /^gpt-5\./.test(String(id)) || String(id).includes("codex"));
+    return {
+      status: "ok",
+      source: "provider-api",
+      plan: "FreeModel API",
+      message: "FreeModel API key accepted. Dashboard session is required for spend windows.",
+      quotas: {},
+      extraUsage: {
+        modelsCount: modelIds.length,
+        preferredModels,
+      },
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      source: "provider-api",
+      plan: "FreeModel API",
+      message: `FreeModel models API error: ${error.message}`,
+      quotas: {},
+    };
+  }
+}
+
+async function fetchFreeModelDashboardJson(sessionCookie, pathname, proxyOptions = null) {
+  const response = await proxyAwareFetch(`${FREEMODEL_CONFIG.dashboardBaseUrl}${pathname}`, {
+    method: "GET",
+    headers: {
+      Cookie: sessionCookie,
+      Accept: "application/json",
+      "User-Agent": getPlatformUserAgent(),
+    },
+  }, proxyOptions);
+  const text = await response.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+  }
+  return { ok: response.ok, status: response.status, data };
+}
+
+function normalizeFreeModelSessionCookie(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const match = raw.match(/(?:^|;\s*)bm_session=([^;]+)/);
+  return match ? `bm_session=${match[1]}` : `bm_session=${raw}`;
+}
+
+function formatFreeModelWindow(windowData, name, windowId) {
+  if (!windowData || typeof windowData !== "object") return null;
+  const used = toFiniteNumber(windowData.usedCents, NaN);
+  const total = toFiniteNumber(windowData.limitCents, NaN);
+  if (!Number.isFinite(used) && !Number.isFinite(total)) return null;
+  const normalizedTotal = Number.isFinite(total) ? total : Math.max(0, used);
+  const normalizedUsed = Number.isFinite(used) ? used : 0;
+  const remaining = Math.max(0, normalizedTotal - normalizedUsed);
+  return {
+    name,
+    used: normalizedUsed,
+    total: normalizedTotal,
+    remaining,
+    remainingPercentage: normalizedTotal > 0 ? Math.max(0, Math.min(100, (remaining / normalizedTotal) * 100)) : null,
+    resetAt: parseResetTime(windowData.resetsAt),
+    unlimited: false,
+    status: remaining <= 0 ? "limit-reached" : "",
+    window: windowId,
+    source: "dashboard-session",
+  };
+}
+
+function freeModelPlanLabel(billing) {
+  const subscription = billing?.subscription;
+  const plan = subscription?.planName || subscription?.name || subscription?.plan?.name || "";
+  return plan ? `FreeModel ${plan}` : "FreeModel";
+}
+
 /**
  * Legacy Claude usage for API key / org admin users
  */
@@ -1031,7 +1273,28 @@ async function getCodexUsage(accessToken, proxyOptions = null) {
     }, proxyOptions);
 
     if (!response.ok) {
-      return { message: `Codex connected. Usage API temporarily unavailable (${response.status}).` };
+      const errorText = await response.text();
+      let errorPayload = {};
+      if (errorText) {
+        try {
+          errorPayload = JSON.parse(errorText);
+        } catch {
+          errorPayload = { raw: errorText };
+        }
+      }
+      const code = errorPayload?.error?.code || "";
+      const detail = errorPayload?.error?.message || "";
+      const message = code === "token_invalidated"
+        ? "Codex token was invalidated; re-authentication is required."
+        : code === "token_expired"
+          ? "Codex token is expired; refresh or re-authentication is required."
+          : detail || `Codex usage API unavailable (${response.status}).`;
+      return {
+        status: response.status === 401 || response.status === 403 ? "requires-reauth" : "unavailable",
+        source: "provider-api",
+        message,
+        quotas: {},
+      };
     }
 
     const data = await response.json();
@@ -1213,6 +1476,271 @@ async function getKiroUsage(accessToken, providerSpecificData, proxyOptions = nu
   return {
     message: fallbackMessage,
     quotas: {},
+  };
+}
+
+/**
+ * OpenCode Go usage.
+ *
+ * Upstream source of truth:
+ * packages/console/app/src/routes/workspace/[id]/go/lite-section.tsx
+ * queryLiteSubscription() returns rollingUsage, weeklyUsage, monthlyUsage,
+ * each already computed through Subscription.analyze*Usage.
+ */
+async function getOpenCodeGoUsage(providerSpecificData = {}, proxyOptions = null) {
+  const workspaceId = String(providerSpecificData?.workspaceId || "").trim();
+  const authCookie = normalizeOpenCodeGoAuthCookie(providerSpecificData?.authCookie);
+
+  if (!workspaceId || !authCookie) {
+    const missing = !workspaceId && !authCookie
+      ? "workspace id and opencode.ai auth cookie"
+      : !workspaceId
+        ? "workspace id"
+        : "opencode.ai auth cookie";
+    return {
+      status: "unavailable",
+      source: "dashboard-session",
+      plan: "OpenCode Go",
+      message: `OpenCode Go console session is not configured. Need ${missing} to read provider usage.`,
+      quotas: {},
+    };
+  }
+
+  const usageUrl = OPENCODE_GO_CONFIG.usageUrl.replace("{workspaceId}", encodeURIComponent(workspaceId));
+
+  try {
+    const response = await proxyAwareFetch(usageUrl, {
+      method: "GET",
+      headers: {
+        Cookie: `${authCookie}; oc_locale=en`,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": getPlatformUserAgent(),
+      },
+    }, proxyOptions);
+
+    if (response.status === 401 || response.status === 403) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "OpenCode Go",
+        message: "OpenCode Go console session expired or lacks access.",
+        quotas: {},
+      };
+    }
+
+    if (response.status === 404) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "OpenCode Go",
+        message: "OpenCode Go workspace was not found.",
+        quotas: {},
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "OpenCode Go",
+        message: `OpenCode Go console returned HTTP ${response.status}.`,
+        quotas: {},
+      };
+    }
+
+    const html = await response.text();
+    const parsed = parseOpenCodeGoUsageHtml(html);
+    if (!parsed.rolling && !parsed.weekly && !parsed.monthly) {
+      return {
+        status: "unavailable",
+        source: "dashboard-session",
+        plan: "OpenCode Go",
+        message: "OpenCode Go console did not return usage windows for this session.",
+        quotas: {},
+      };
+    }
+
+    const quotas = {};
+    if (parsed.rolling) {
+      quotas["session (5h)"] = buildOpenCodeGoQuota(parsed.rolling, OPENCODE_GO_CONFIG.rollingLimitUsd, "5h");
+    }
+    if (parsed.weekly) {
+      quotas["weekly (7d)"] = buildOpenCodeGoQuota(parsed.weekly, OPENCODE_GO_CONFIG.weeklyLimitUsd, "7d");
+    }
+    if (parsed.monthly) {
+      quotas["monthly"] = buildOpenCodeGoQuota(parsed.monthly, OPENCODE_GO_CONFIG.monthlyLimitUsd, "monthly");
+    }
+
+    const monthlyResetAt = parsed.monthly?.resetAt || null;
+
+    return {
+      status: "ok",
+      source: "dashboard-session",
+      plan: "OpenCode Go",
+      account: { workspaceId, mine: parsed.mine ?? null, useBalance: parsed.useBalance ?? null },
+      billingPeriodEnd: monthlyResetAt,
+      quotas,
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      source: "dashboard-session",
+      plan: "OpenCode Go",
+      message: `OpenCode Go usage fetch failed: ${error.message}`,
+      quotas: {},
+    };
+  }
+}
+
+function normalizeOpenCodeGoAuthCookie(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const authMatch = raw.match(/(?:^|;\s*)auth=([^;]+)/);
+  if (authMatch) return `auth=${authMatch[1]}`;
+  return `auth=${raw}`;
+}
+
+function parseOpenCodeGoUsageHtml(html) {
+  return {
+    rolling: parseOpenCodeGoHydratedWindow(html, "rollingUsage") || parseOpenCodeGoTextWindow(html, "Rolling Usage"),
+    weekly: parseOpenCodeGoHydratedWindow(html, "weeklyUsage") || parseOpenCodeGoTextWindow(html, "Weekly Usage"),
+    monthly: parseOpenCodeGoHydratedWindow(html, "monthlyUsage") || parseOpenCodeGoTextWindow(html, "Monthly Usage"),
+    mine: parseOpenCodeGoBoolean(html, "mine"),
+    useBalance: parseOpenCodeGoBoolean(html, "useBalance"),
+  };
+}
+
+function parseOpenCodeGoHydratedWindow(html, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    new RegExp(`${escaped}:\\$R\\[\\d+\\]=\\{([^}]{0,700})\\}`),
+    new RegExp(`${escaped}=\\{([^}]{0,700})\\}`),
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(html);
+    if (!match) continue;
+    return parseOpenCodeGoWindowObject(match[1]);
+  }
+
+  return null;
+}
+
+function parseOpenCodeGoWindowObject(raw) {
+  const usagePercent = readOpenCodeGoNumberField(raw, "usagePercent");
+  if (!Number.isFinite(usagePercent)) return null;
+
+  const resetInSec = readOpenCodeGoNumberField(raw, "resetInSec");
+  const resetDate = readOpenCodeGoStringField(raw, "resetDate");
+  const resetTimestamp = readOpenCodeGoNumberField(raw, "resetTimestamp");
+  let resetAt = null;
+  if (Number.isFinite(resetInSec)) {
+    resetAt = new Date(Date.now() + Math.max(0, resetInSec) * 1000).toISOString();
+  } else if (resetDate) {
+    resetAt = parseResetTime(resetDate);
+  } else if (Number.isFinite(resetTimestamp)) {
+    resetAt = parseResetTime(resetTimestamp);
+  }
+
+  return {
+    usagePercent: Math.max(0, Math.min(100, usagePercent)),
+    resetInSec: Number.isFinite(resetInSec) ? Math.max(0, resetInSec) : null,
+    resetAt,
+    status: readOpenCodeGoStringField(raw, "status") || "",
+  };
+}
+
+function readOpenCodeGoNumberField(raw, key) {
+  const match = new RegExp(`${key}:([^,}]+)`).exec(raw);
+  if (!match) return NaN;
+  return Number(match[1].replace(/^"|"$/g, "").trim());
+}
+
+function readOpenCodeGoStringField(raw, key) {
+  const match = new RegExp(`${key}:("([^"]*)"|[^,}]+)`).exec(raw);
+  if (!match) return "";
+  return String(match[2] ?? match[1]).replace(/^"|"$/g, "").trim();
+}
+
+function parseOpenCodeGoBoolean(html, key) {
+  const match = new RegExp(`${key}:\\$R\\[\\d+\\]=(true|false)|${key}=(true|false)`).exec(html);
+  if (!match) return null;
+  return (match[1] || match[2]) === "true";
+}
+
+function parseOpenCodeGoTextWindow(html, label) {
+  const text = htmlToPlainText(html);
+  const start = text.indexOf(label);
+  if (start < 0) return null;
+
+  const labels = ["Rolling Usage", "Weekly Usage", "Monthly Usage", "Use your available balance"];
+  let end = text.length;
+  for (const nextLabel of labels) {
+    if (nextLabel === label) continue;
+    const index = text.indexOf(nextLabel, start + label.length);
+    if (index >= 0 && index < end) end = index;
+  }
+
+  const section = text.slice(start, end);
+  const percentMatch = section.match(/(\d{1,3})\s*%/);
+  const resetMatch = section.match(/Resets in\s+(.+)$/i);
+  if (!percentMatch || !resetMatch) return null;
+
+  const resetInSec = parseOpenCodeGoDurationSeconds(resetMatch[1]);
+  if (!Number.isFinite(resetInSec)) return null;
+
+  return {
+    usagePercent: Math.max(0, Math.min(100, Number(percentMatch[1]))),
+    resetInSec,
+    resetAt: new Date(Date.now() + resetInSec * 1000).toISOString(),
+    status: "",
+  };
+}
+
+function htmlToPlainText(html) {
+  return String(html || "")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseOpenCodeGoDurationSeconds(text) {
+  let total = 0;
+  let matched = false;
+  const pattern = /(\d+)\s*(weeks?|days?|hours?|minutes?|seconds?|w|d|h|m|s)\b/gi;
+  for (const match of String(text || "").matchAll(pattern)) {
+    const amount = Number(match[1]);
+    const unit = String(match[2] || "").toLowerCase();
+    if (!Number.isFinite(amount)) continue;
+    matched = true;
+    if (unit === "w" || unit.startsWith("week")) total += amount * 604800;
+    else if (unit === "d" || unit.startsWith("day")) total += amount * 86400;
+    else if (unit === "h" || unit.startsWith("hour")) total += amount * 3600;
+    else if (unit === "m" || unit.startsWith("minute")) total += amount * 60;
+    else if (unit === "s" || unit.startsWith("second")) total += amount;
+  }
+  return matched ? total : NaN;
+}
+
+function buildOpenCodeGoQuota(window, totalUsd, windowName) {
+  const used = Math.max(0, Math.min(100, toFiniteNumber(window.usagePercent, 0)));
+  const total = Math.max(0, totalUsd);
+  const usedUsd = total * (used / 100);
+  const remaining = Math.max(0, total - usedUsd);
+  return {
+    used: usedUsd,
+    total,
+    remaining,
+    remainingPercentage: Math.max(0, 100 - used),
+    resetAt: window.resetAt || null,
+    unlimited: false,
+    status: window.status || "ok",
+    window: windowName,
+    source: "dashboard-session",
   };
 }
 
