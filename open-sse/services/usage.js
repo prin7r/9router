@@ -57,6 +57,11 @@ const OPENROUTER_CONFIG = {
   creditsUrl: "https://openrouter.ai/api/v1/credits",
 };
 
+const GROQ_CONFIG = {
+  chatCompletionsUrl: "https://api.groq.com/openai/v1/chat/completions",
+  probeModel: "openai/gpt-oss-20b",
+};
+
 const FREEMODEL_CONFIG = {
   apiBaseUrl: "https://api.freemodel.dev",
   dashboardBaseUrl: "https://freemodel.dev",
@@ -119,6 +124,8 @@ export async function getUsageForProvider(connection, proxyOptions = null) {
       return await getOllamaUsage(accessToken);
     case "openrouter":
       return await getOpenRouterUsage(apiKey || accessToken, proxyOptions);
+    case "groq":
+      return await getGroqUsage(apiKey || accessToken, proxyOptions);
     case "freemodel":
       return await getFreeModelUsage(apiKey || accessToken, providerSpecificData, proxyOptions);
     case "commandcode":
@@ -765,6 +772,162 @@ function parseOpenRouterReset(value) {
   if (!value) return null;
   if (typeof value === "string" && value.toLowerCase() === "monthly") return "monthly";
   return parseResetTime(value);
+}
+
+async function getGroqUsage(apiKey, proxyOptions = null) {
+  if (!apiKey) {
+    return {
+      status: "missing-secret",
+      source: "provider-api",
+      plan: "Groq",
+      message: "Groq API key not available.",
+      quotas: {},
+    };
+  }
+
+  try {
+    const response = await proxyAwareFetch(GROQ_CONFIG.chatCompletionsUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: GROQ_CONFIG.probeModel,
+        messages: [{ role: "user", content: "quota" }],
+        max_completion_tokens: 1,
+        temperature: 0,
+      }),
+    }, proxyOptions);
+
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+    }
+
+    const quotas = {};
+    const requestQuota = groqQuotaFromHeaders(
+      response.headers,
+      "x-ratelimit-limit-requests",
+      "x-ratelimit-remaining-requests",
+      "x-ratelimit-reset-requests",
+      "requests",
+      "request rate limit",
+    );
+    const tokenQuota = groqQuotaFromHeaders(
+      response.headers,
+      "x-ratelimit-limit-tokens",
+      "x-ratelimit-remaining-tokens",
+      "x-ratelimit-reset-tokens",
+      "tokens",
+      "token rate limit",
+    );
+    if (requestQuota) quotas.requests = requestQuota;
+    if (tokenQuota) quotas.tokens = tokenQuota;
+
+    const bodyMessage = groqErrorMessage(data);
+    if (response.status === 401 || response.status === 403) {
+      return {
+        status: "requires-reauth",
+        source: "provider-api",
+        plan: "Groq",
+        message: bodyMessage || `Groq API key rejected with HTTP ${response.status}.`,
+        quotas,
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        status: response.status === 429 ? "rate-limited" : "unavailable",
+        source: "provider-api",
+        plan: "Groq",
+        message: bodyMessage || `Groq chat completions probe returned HTTP ${response.status}.`,
+        quotas,
+      };
+    }
+
+    return {
+      status: Object.keys(quotas).length ? "ok" : "unavailable",
+      source: "provider-api",
+      plan: "Groq",
+      message: Object.keys(quotas).length ? "" : "Groq accepted the API key, but did not return rate limit headers.",
+      quotas,
+      totalTokens: toFiniteNumber(data?.usage?.total_tokens, null),
+      extraUsage: {
+        probeModel: data?.model || GROQ_CONFIG.probeModel,
+        promptTokens: toFiniteNumber(data?.usage?.prompt_tokens, null),
+        completionTokens: toFiniteNumber(data?.usage?.completion_tokens, null),
+        totalTokens: toFiniteNumber(data?.usage?.total_tokens, null),
+      },
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      source: "provider-api",
+      plan: "Groq",
+      message: `Groq usage probe failed: ${error.message}`,
+      quotas: {},
+    };
+  }
+}
+
+function groqQuotaFromHeaders(headers, limitHeader, remainingHeader, resetHeader, window, name) {
+  const limit = toFiniteNumber(headers.get(limitHeader), NaN);
+  const remaining = toFiniteNumber(headers.get(remainingHeader), NaN);
+  if (!Number.isFinite(limit) && !Number.isFinite(remaining)) return null;
+
+  const total = Number.isFinite(limit) ? limit : Math.max(0, remaining);
+  const safeRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : total;
+  const used = Math.max(0, total - safeRemaining);
+  return {
+    name,
+    used,
+    total,
+    remaining: safeRemaining,
+    remainingPercentage: total > 0 ? Math.max(0, Math.min(100, (safeRemaining / total) * 100)) : null,
+    resetAt: parseGroqReset(headers.get(resetHeader)),
+    unlimited: false,
+    status: safeRemaining <= 0 ? "rate-limited" : "",
+    window,
+    source: "provider-api",
+  };
+}
+
+function parseGroqReset(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const unitPattern = /(\d+(?:\.\d+)?)(ms|s|m|h|d)\b/gi;
+  let totalMs = 0;
+  let matched = false;
+  for (const match of raw.matchAll(unitPattern)) {
+    matched = true;
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    if (!Number.isFinite(amount)) continue;
+    if (unit === "ms") totalMs += amount;
+    else if (unit === "s") totalMs += amount * 1000;
+    else if (unit === "m") totalMs += amount * 60_000;
+    else if (unit === "h") totalMs += amount * 3_600_000;
+    else if (unit === "d") totalMs += amount * 86_400_000;
+  }
+  if (matched) return new Date(Date.now() + totalMs).toISOString();
+
+  return parseResetTime(raw);
+}
+
+function groqErrorMessage(payload) {
+  const error = payload?.error;
+  if (!error) return "";
+  if (typeof error === "string") return error;
+  return error.message || error.error || error.type || "";
 }
 
 async function getFreeModelUsage(apiKey, providerSpecificData = {}, proxyOptions = null) {
